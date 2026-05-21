@@ -136,13 +136,86 @@ a:hover { color: var(--amber-hot); }
   letter-spacing: 0.16em;
   text-transform: uppercase;
   color: var(--amber);
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 .panel__title-sub {
   color: var(--ink-faint);
   font-weight: 400; letter-spacing: 0;
   text-transform: none;
-  margin-left: 8px;
+  margin-left: auto;
 }
+.panel__collapse {
+  background: transparent;
+  border: 1px solid var(--line-bright);
+  color: var(--ink-faint);
+  width: 18px; height: 18px;
+  padding: 0;
+  font: 700 13px/1 var(--font-data);
+  cursor: pointer;
+  border-radius: 2px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: color var(--tr), border-color var(--tr);
+}
+.panel__collapse:hover { color: var(--amber); border-color: var(--amber); }
+.panel__section-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.panel__section.is-collapsed { flex: none !important; }
+.panel__section.is-collapsed .panel__section-body { display: none; }
+.panel__section.is-collapsed .panel__title { margin-bottom: 0; }
+
+/* En panel--left: el catalog ocupa el espacio flexible, observer queda al final con tamaño natural.
+   Override del .panel__section:last-child {flex:1} que aplica bien al panel--right (next-passes). */
+.panel--left .panel__section--catalog { flex: 1; min-height: 0; }
+.panel--left .panel__section:last-child { flex: none; }
+
+/* Mode toggle (segmented control) */
+.mode-toggle {
+  display: flex;
+  margin-bottom: 8px;
+  border: 1px solid var(--line-bright);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+.mode-toggle__btn {
+  flex: 1;
+  background: transparent;
+  color: var(--ink-dim);
+  border: none;
+  padding: 6px 6px;
+  font: 700 10px var(--font-data);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background var(--tr), color var(--tr);
+}
+.mode-toggle__btn:not(:last-child) { border-right: 1px solid var(--line-bright); }
+.mode-toggle__btn:hover:not(:disabled) { color: var(--amber); }
+.mode-toggle__btn.is-active {
+  background: rgba(255,181,71,0.12);
+  color: var(--amber);
+  box-shadow: inset 0 -2px 0 var(--amber);
+}
+.mode-toggle__btn:disabled { opacity: 0.5; cursor: wait; }
+
+/* Mensajes guía dentro del catalog (vacío, top-N, sin matches) */
+.catalog__hint {
+  padding: 16px 12px;
+  text-align: center;
+  color: var(--ink-faint);
+  font-size: 11px;
+  list-style: none;
+  border-bottom: 1px solid var(--line);
+  line-height: 1.5;
+}
+.catalog__hint em { color: var(--amber); font-style: normal; font-weight: 700; }
 
 /* ============ Catálogo de satélites ============ */
 .catalog__bar { display: flex; gap: 6px; margin-bottom: 10px; }
@@ -406,7 +479,7 @@ a:hover { color: var(--amber-hot); }
 
 /* ============ Boot overlay ============ */
 .boot {
-  position: fixed; inset: 0; z-index: 100;
+  position: fixed; inset: 0; z-index: 9999;
   background: #03060a;
   display: flex; align-items: center; justify-content: center;
   transition: opacity 400ms ease;

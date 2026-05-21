@@ -52,13 +52,24 @@
 
   <!-- COLUMNA IZQUIERDA: catálogo + acciones -->
   <aside class="panel panel--left">
-    <section class="panel__section">
-      <h2 class="panel__title">› catalog</h2>
-      <div class="catalog__bar">
-        <input id="search" type="search" placeholder="filtrar..." class="input" />
-        <button id="reloadTLE" class="btn" title="Recargar TLE desde CelesTrak">⟳</button>
+    <section class="panel__section panel__section--catalog">
+      <h2 class="panel__title">
+        <button id="catCollapse" class="panel__collapse" type="button" aria-label="Plegar catálogo" aria-expanded="true">−</button>
+        <span>› catalog</span>
+        <span class="panel__title-sub" id="catCount"></span>
+      </h2>
+      <div class="panel__section-body">
+        <div class="mode-toggle" role="tablist" aria-label="Modo de catálogo">
+          <button type="button" class="mode-toggle__btn is-active" data-mode="stations" role="tab" aria-selected="true">stations + science</button>
+          <button type="button" class="mode-toggle__btn" data-mode="mix" role="tab" aria-selected="false">mix LEO</button>
+          <button type="button" class="mode-toggle__btn" data-mode="active" role="tab" aria-selected="false" title="CelesTrak puede devolver 403 a este grupo">active</button>
+        </div>
+        <div class="catalog__bar">
+          <input id="search" type="search" placeholder="filtrar..." class="input" />
+          <button id="reloadTLE" class="btn" title="Recargar TLE desde CelesTrak">⟳</button>
+        </div>
+        <ul id="satList" class="catalog__list" role="listbox" aria-label="Catálogo de satélites"></ul>
       </div>
-      <ul id="satList" class="catalog__list" role="listbox" aria-label="Catálogo de satélites"></ul>
     </section>
 
     <section class="panel__section">

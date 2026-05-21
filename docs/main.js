@@ -15,6 +15,7 @@
   // ---------- estado global -----------
   const state = {
     wasmReady: false,
+    mode: "stations",       // "stations" | "mix"
     selected: null,         // nombre del satélite seleccionado
     sats: [],               // últimas posiciones [{name, lat, lon, ...}]
     markers: new Map(),     // name -> L.marker
@@ -44,11 +45,51 @@
     rdVel: $("rdVel"), rdPer: $("rdPer"), rdFp: $("rdFp"),
     passes: $("passes"), passInfo: $("passInfo"),
     lastTleUpdate: $("lastTleUpdate"),
+    catCollapse: $("catCollapse"), catCount: $("catCount"),
+    modeBtns: document.querySelectorAll(".mode-toggle__btn"),
   };
 
-  // ---------- TLE source ----------
-  // CelesTrak group "stations" incluye ISS, Tiangong, CSS, y otras estaciones.
-  const TLE_URL = "https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=tle";
+  // ---------- TLE sources por modo ----------
+  // Cada modo define qué grupos de CelesTrak cargar, cada cuánto refrescar
+  // posiciones, y si la lista del catalog se renderiza entera (decenas) o
+  // solo bajo búsqueda (miles, p. ej. active).
+  const MODES = {
+    stations: {
+      label: "stations + science",
+      urls: [
+        "https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=tle",
+        "https://celestrak.org/NORAD/elements/gp.php?GROUP=science&FORMAT=tle",
+      ],
+      refreshMs: 1000,
+      showFullList: true,
+    },
+    // Modo masivo: combinación de grupos LEO que CelesTrak NO bloquea
+    // (active y starlink devuelven 403). Total ~2 300 sats, todos LEO,
+    // compatibles con SGP4 puro. Lista no se renderiza entera, solo por
+    // búsqueda. Refresh a 5 s por carga.
+    mix: {
+      label: "oneweb + cubesat + visual",
+      urls: [
+        "https://celestrak.org/NORAD/elements/gp.php?GROUP=oneweb&FORMAT=tle",
+        "https://celestrak.org/NORAD/elements/gp.php?GROUP=cubesat&FORMAT=tle",
+        "https://celestrak.org/NORAD/elements/gp.php?GROUP=visual&FORMAT=tle",
+      ],
+      refreshMs: 5000,
+      showFullList: false,
+    },
+    // Modo active: catálogo completo de CelesTrak (~11 000 sats). Actualmente
+    // CelesTrak devuelve 403 a este grupo, pero se mantiene por si en algún
+    // momento se desbloquea. Si falla, el usuario verá TLE_ERR y puede volver
+    // a stations o mix. Mezcla LEO/MEO/GEO: el SGP4 puro solo propaga bien LEO.
+    active: {
+      label: "active (puede estar bloqueado)",
+      urls: ["https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle"],
+      refreshMs: 5000,
+      showFullList: false,
+    },
+  };
+  // Tope de items renderizados en lista/markers en modos con showFullList=false.
+  const SEARCH_LIMIT = 100;
 
   // ===== utilidades de formato =====
   const fmt = (n, d=2) => (n==null||isNaN(n)) ? "—" : Number(n).toFixed(d);
@@ -107,6 +148,9 @@
       console.error(err);
       setBootLine(els.bootTLE, false, "[ FAIL ]");
       setStatus("TLE_ERR", "err");
+      els.satList.innerHTML =
+        `<li class="catalog__hint">error cargando TLE:<br><em>${escapeHtml(err.message)}</em><br>pulsa ⟳ para reintentar</li>`;
+      hideBoot();
     });
   };
 
@@ -136,34 +180,171 @@
   // 4. Fetch TLE desde CelesTrak y pasarlo al WASM
   //    (hacerlo desde JS evita problemas de CORS en Go syscall/js)
   // ============================================================
+  // localStorage cache para mitigar rate-limit 403 de CelesTrak: cuando la red
+  // falla y hay una respuesta reciente cacheada, la usamos.
+  const TLE_CACHE_MAX_AGE_MS = 30 * 60 * 1000; // 30 min
+  const TLE_CACHE_KEY = (url) => "tle:" + url;
+
+  // Fetch de una URL TLE con reintentos backoff en 403/429 y fallback a caché.
+  async function fetchTLE(url) {
+    const backoffs = [0, 800, 1800, 3500];
+    let lastErr;
+    for (let i = 0; i < backoffs.length; i++) {
+      if (backoffs[i] > 0) await new Promise(r => setTimeout(r, backoffs[i]));
+      try {
+        const resp = await fetch(url, { cache: "no-store" });
+        if (resp.ok) {
+          const text = await resp.text();
+          try {
+            localStorage.setItem(TLE_CACHE_KEY(url), JSON.stringify({ ts: Date.now(), text }));
+          } catch (_) { /* quota / modo privado: ignorar */ }
+          return { text, fromCache: false };
+        }
+        lastErr = new Error("HTTP " + resp.status);
+        // Solo merece la pena reintentar en rate-limits.
+        if (resp.status !== 403 && resp.status !== 429) break;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    // Red falló: ¿tenemos caché reciente?
+    try {
+      const raw = localStorage.getItem(TLE_CACHE_KEY(url));
+      if (raw) {
+        const c = JSON.parse(raw);
+        if (c && c.text && Date.now() - c.ts < TLE_CACHE_MAX_AGE_MS) {
+          return { text: c.text, fromCache: true, ageMin: Math.round((Date.now() - c.ts) / 60000) };
+        }
+      }
+    } catch (_) {}
+    throw lastErr || new Error("desconocido");
+  }
+
   async function loadTLEFromCelesTrak() {
     setStatus("FETCH_TLE", "warn");
-    const resp = await fetch(TLE_URL, { cache: "no-store" });
-    if (!resp.ok) throw new Error("CelesTrak HTTP " + resp.status);
-    const text = await resp.text();
+    const cfg = MODES[state.mode];
+    // Serie + pausa entre URLs para no disparar el rate-limit de CelesTrak.
+    // Tolera fallos parciales y respaldo a caché individual por URL.
+    const texts = [];
+    const failed = [];
+    const cacheNotes = [];
+    for (let i = 0; i < cfg.urls.length; i++) {
+      if (i > 0) await new Promise(r => setTimeout(r, 400));
+      try {
+        const res = await fetchTLE(cfg.urls[i]);
+        texts.push(res.text);
+        if (res.fromCache) cacheNotes.push(`caché ~${res.ageMin}m`);
+      } catch (e) {
+        failed.push({ url: cfg.urls[i], err: e.message });
+      }
+    }
+    if (texts.length === 0) {
+      throw new Error("CelesTrak: ninguna URL respondió (" + failed.map(f => f.err).join(", ") + ")");
+    }
+    const combined = texts.join("\n");
     setBootProgress(75);
-    const result = window.SatTracker.loadTLE(text);
+    const result = window.SatTracker.loadTLE(combined);
     if (!result.ok) throw new Error("loadTLE: " + result.error);
     setBootLine(els.bootTLE, true, `[ ${result.count} sats ]`);
     setBootProgress(100);
     els.satCount.textContent = result.count;
-    els.lastTleUpdate.textContent = "TLE actualizado " + fmtDateUtc(new Date());
+    els.catCount.textContent = `(${result.count})`;
+    const stamp = "TLE actualizado " + fmtDateUtc(new Date());
+    const annotations = [];
+    if (failed.length) annotations.push(`${failed.length} grupo(s) con error`);
+    if (cacheNotes.length) annotations.push(cacheNotes.join(", "));
+    els.lastTleUpdate.textContent = annotations.length ? `${stamp} · ${annotations.join(" · ")}` : stamp;
     renderSatList();
     startTicker();
-    setStatus("TRACKING", "ok");
-    setTimeout(() => els.boot.classList.add("is-hidden"), 350);
-    setTimeout(() => els.boot.remove(), 1200);
+    if (failed.length)        setStatus("PARCIAL", "warn");
+    else if (cacheNotes.length) setStatus("CACHÉ", "warn");
+    else                        setStatus("TRACKING", "ok");
+    hideBoot();
   }
+
+  // Oculta el boot overlay. Llamado tanto en éxito como en fallo: si lo
+  // dejamos visible cuando hay error, los z-index de Leaflet pasan por encima
+  // y el usuario solo ve el mapa flotando sobre fondo negro, sin pistas.
+  function hideBoot() {
+    if (!els.boot || !els.boot.isConnected) return;
+    setTimeout(() => els.boot.classList.add("is-hidden"), 350);
+    setTimeout(() => { if (els.boot.isConnected) els.boot.remove(); }, 1200);
+  }
+
+  // ============================================================
+  // 4b. Cambio de modo de catálogo
+  // ============================================================
+  async function setMode(mode) {
+    if (mode === state.mode || !MODES[mode]) return;
+    state.mode = mode;
+    state.selected = null;
+    els.modeBtns.forEach(b => {
+      const on = b.dataset.mode === mode;
+      b.classList.toggle("is-active", on);
+      b.setAttribute("aria-selected", String(on));
+      b.disabled = true;
+    });
+    // Limpiar mapa: markers, labels, footprint del modo anterior.
+    for (const m of state.markers.values()) map.removeLayer(m);
+    state.markers.clear();
+    for (const l of state.labels.values()) map.removeLayer(l);
+    state.labels.clear();
+    if (state.footprint) { map.removeLayer(state.footprint); state.footprint = null; }
+    // Reset panel target.
+    els.tgtName.textContent = "— ningún satélite seleccionado —";
+    els.tgtId.textContent = "";
+    ["rdLat","rdLon","rdAlt","rdVel","rdPer","rdFp"].forEach(k => { els[k].textContent = "—"; });
+    els.passInfo.textContent = "";
+    els.passes.innerHTML = `<div class="passes__empty">selecciona un satélite y pulsa <em>predict</em></div>`;
+    // Parar ticker y limpiar lista mientras recarga.
+    if (state.tickIntervalId) { clearInterval(state.tickIntervalId); state.tickIntervalId = null; }
+    els.satList.innerHTML = `<li class="catalog__hint">cargando ${MODES[mode].label}...</li>`;
+    els.search.value = "";
+    try {
+      await loadTLEFromCelesTrak();
+    } catch (e) {
+      console.error(e);
+      setStatus("TLE_ERR", "err");
+      els.satList.innerHTML = `<li class="catalog__hint">error: ${escapeHtml(e.message)}</li>`;
+    } finally {
+      els.modeBtns.forEach(b => { b.disabled = false; });
+    }
+  }
+  els.modeBtns.forEach(b => b.addEventListener("click", () => setMode(b.dataset.mode)));
+
+  // Collapse / expand del catalog.
+  els.catCollapse.addEventListener("click", () => {
+    const section = els.catCollapse.closest(".panel__section");
+    const collapsed = section.classList.toggle("is-collapsed");
+    els.catCollapse.textContent = collapsed ? "+" : "−";
+    els.catCollapse.setAttribute("aria-expanded", String(!collapsed));
+    els.catCollapse.setAttribute("aria-label", collapsed ? "Expandir catálogo" : "Plegar catálogo");
+  });
 
   // ============================================================
   // 5. Render lista de satélites (catálogo)
   // ============================================================
   function renderSatList() {
+    const cfg = MODES[state.mode];
     const names = window.SatTracker.listSats();
     els.satList.innerHTML = "";
     const filter = els.search.value.trim().toLowerCase();
+
+    // En modos masivos sin búsqueda: no renderizar miles de <li>.
+    if (!cfg.showFullList && !filter) {
+      const li = document.createElement("li");
+      li.className = "catalog__hint";
+      li.innerHTML = `<em>${names.length}</em> sats cargados<br>escribe para buscar`;
+      els.satList.appendChild(li);
+      return;
+    }
+
+    const MAX = cfg.showFullList ? Infinity : SEARCH_LIMIT;
+    let shown = 0, matched = 0;
     for (const name of names) {
       if (filter && !name.toLowerCase().includes(filter)) continue;
+      matched++;
+      if (shown >= MAX) continue;
       const li = document.createElement("li");
       li.className = "sat-item" + (name === state.selected ? " is-active" : "");
       li.innerHTML = `
@@ -172,9 +353,48 @@
       `;
       li.addEventListener("click", () => selectSat(name));
       els.satList.appendChild(li);
+      shown++;
+    }
+    if (matched === 0) {
+      const li = document.createElement("li");
+      li.className = "catalog__hint";
+      li.textContent = filter ? "sin coincidencias" : "(vacío)";
+      els.satList.appendChild(li);
+    } else if (matched > shown) {
+      const li = document.createElement("li");
+      li.className = "catalog__hint";
+      li.innerHTML = `+ <em>${matched - shown}</em> coincidencias más — refina la búsqueda`;
+      els.satList.appendChild(li);
     }
   }
-  els.search.addEventListener("input", renderSatList);
+  els.search.addEventListener("input", () => {
+    renderSatList();
+    // En modo restringido, los markers también cambian con el filtro: forzamos
+    // un tick inmediato para reflejarlo sin esperar al intervalo.
+    if (state.wasmReady && !MODES[state.mode].showFullList) tick();
+  });
+
+  // Conjunto de satélites cuyo marker debe mostrarse en el mapa este tick.
+  // En modo full: todos. En modo restringido: seleccionado + matches del filtro (cap SEARCH_LIMIT).
+  function computeVisibleSet(arr) {
+    const cfg = MODES[state.mode];
+    const result = new Set();
+    if (cfg.showFullList) {
+      for (const s of arr) result.add(s.name);
+      return result;
+    }
+    if (state.selected) result.add(state.selected);
+    const filter = els.search.value.trim().toLowerCase();
+    if (!filter) return result;
+    let count = 0;
+    for (const s of arr) {
+      if (s.name.toLowerCase().includes(filter)) {
+        result.add(s.name);
+        if (++count >= SEARCH_LIMIT) break;
+      }
+    }
+    return result;
+  }
 
   // ============================================================
   // 6. Selección de satélite
@@ -194,6 +414,10 @@
     if (sat) map.panTo([sat.lat, sat.lon], { animate: true });
     els.tgtName.textContent = name;
     els.tgtId.textContent = "selecciona PREDICT para próximos pasos";
+    // En modo restringido el marker puede no existir aún si el satélite venía
+    // de los resultados de búsqueda; fuerza un tick para que aparezca sin
+    // esperar al siguiente intervalo (5 s en el modo masivo).
+    if (state.wasmReady && !MODES[state.mode].showFullList) tick();
   }
 
   // ============================================================
@@ -201,8 +425,9 @@
   // ============================================================
   function startTicker() {
     if (state.tickIntervalId) clearInterval(state.tickIntervalId);
+    const cfg = MODES[state.mode];
     tick();
-    state.tickIntervalId = setInterval(tick, 1000);
+    state.tickIntervalId = setInterval(tick, cfg.refreshMs);
   }
 
   function tick() {
@@ -234,7 +459,8 @@
       });
     }
     state.sats = arr;
-    refreshMarkers(arr);
+    const visible = computeVisibleSet(arr);
+    refreshMarkers(arr, visible);
     refreshReadout(arr);
     const elapsed = performance.now() - t0;
     els.tickMs.textContent = elapsed.toFixed(0);
@@ -259,10 +485,11 @@
     });
   }
 
-  function refreshMarkers(arr) {
+  function refreshMarkers(arr, visible) {
     const seen = new Set();
     for (const s of arr) {
       if (s.error) continue;
+      if (!visible.has(s.name)) continue;
       seen.add(s.name);
       let m = state.markers.get(s.name);
       if (!m) {
