@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>ORBITAL // Real-Time Satellite Tracker</title>
+<meta name="description" content="Tracking de satélites en tiempo real con SGP4 corriendo en WebAssembly." />
+
+<!-- Fuentes: JetBrains Mono para datos, Space Grotesk para titulares.
+     Solo dos pesos por fuente para minimizar peso de descarga. -->
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=VT323&display=swap" rel="stylesheet" />
+
+<!-- Leaflet desde CDN: ligero, sin dependencias propias. -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<!-- Layer de overlay durante la carga del WASM -->
+<div id="boot" class="boot">
+  <div class="boot__crt">
+    <pre id="bootLog" class="boot__log">[ INIT ] orbital tracker
+[ LOAD ] wasm_exec.js ... <span class="ok">OK</span>
+[ LOAD ] go runtime ... <span id="bootGo">[      ]</span>
+[ LOAD ] tle catalog ... <span id="bootTLE">[      ]</span>
+</pre>
+    <div class="boot__bar"><div class="boot__bar-inner" id="bootBar"></div></div>
+  </div>
+</div>
+
+<header class="topbar">
+  <div class="topbar__brand">
+    <span class="brand__mark">◉</span>
+    <span class="brand__name">ORBITAL</span>
+    <span class="brand__sub">v1.0 // sgp4-wasm</span>
+  </div>
+  <div class="topbar__telemetry">
+    <div class="telem"><span class="telem__k">UTC</span><span class="telem__v" id="utcClock">--:--:--</span></div>
+    <div class="telem"><span class="telem__k">SATS</span><span class="telem__v" id="satCount">0</span></div>
+    <div class="telem"><span class="telem__k">TICK</span><span class="telem__v" id="tickMs">--</span><span class="telem__u">ms</span></div>
+    <div class="telem"><span class="telem__k">STATUS</span><span class="telem__v telem__v--ok" id="statusLed">STANDBY</span></div>
+  </div>
+</header>
+
+<main class="grid">
+
+  <!-- COLUMNA IZQUIERDA: catálogo + acciones -->
+  <aside class="panel panel--left">
+    <section class="panel__section">
+      <h2 class="panel__title">› catalog</h2>
+      <div class="catalog__bar">
+        <input id="search" type="search" placeholder="filtrar..." class="input" />
+        <button id="reloadTLE" class="btn" title="Recargar TLE desde CelesTrak">⟳</button>
+      </div>
+      <ul id="satList" class="catalog__list" role="listbox" aria-label="Catálogo de satélites"></ul>
+    </section>
+
+    <section class="panel__section">
+      <h2 class="panel__title">› observer</h2>
+      <div class="form-grid">
+        <label class="form-row">
+          <span class="form-row__k">lat</span>
+          <input id="obsLat" type="number" step="0.001" value="40.4168" class="input input--mono" />
+          <span class="form-row__u">°N</span>
+        </label>
+        <label class="form-row">
+          <span class="form-row__k">lon</span>
+          <input id="obsLon" type="number" step="0.001" value="-3.7038" class="input input--mono" />
+          <span class="form-row__u">°E</span>
+        </label>
+        <label class="form-row">
+          <span class="form-row__k">alt</span>
+          <input id="obsAlt" type="number" step="0.01" value="0.65" class="input input--mono" />
+          <span class="form-row__u">km</span>
+        </label>
+        <label class="form-row">
+          <span class="form-row__k">min el</span>
+          <input id="minEl" type="number" step="1" value="10" class="input input--mono" />
+          <span class="form-row__u">°</span>
+        </label>
+      </div>
+      <div class="btn-row">
+        <button id="useGeo" class="btn btn--ghost">use my location</button>
+        <button id="predict" class="btn btn--primary">predict 24h ▸</button>
+      </div>
+    </section>
+  </aside>
+
+  <!-- MAPA -->
+  <section class="map-wrap">
+    <div id="map" class="map" aria-label="Mapa mundial con posiciones de satélites"></div>
+    <div class="map__legend">
+      <span><i class="dot dot--sat"></i> satellite</span>
+      <span><i class="dot dot--obs"></i> observer</span>
+      <span><i class="dot dot--footprint"></i> footprint</span>
+    </div>
+  </section>
+
+  <!-- COLUMNA DERECHA: panel del satélite seleccionado -->
+  <aside class="panel panel--right">
+    <section class="panel__section">
+      <h2 class="panel__title">› target</h2>
+      <div class="target">
+        <div class="target__name" id="tgtName">— ningún satélite seleccionado —</div>
+        <div class="target__id" id="tgtId">&nbsp;</div>
+      </div>
+
+      <dl class="readout">
+        <div class="readout__row">
+          <dt>latitude</dt>  <dd id="rdLat">—</dd> <dd class="u">°N</dd>
+        </div>
+        <div class="readout__row">
+          <dt>longitude</dt> <dd id="rdLon">—</dd> <dd class="u">°E</dd>
+        </div>
+        <div class="readout__row">
+          <dt>altitude</dt>  <dd id="rdAlt">—</dd> <dd class="u">km</dd>
+        </div>
+        <div class="readout__row">
+          <dt>velocity</dt>  <dd id="rdVel">—</dd> <dd class="u">km/s</dd>
+        </div>
+        <div class="readout__row">
+          <dt>period</dt>    <dd id="rdPer">—</dd> <dd class="u">min</dd>
+        </div>
+        <div class="readout__row">
+          <dt>footprint</dt> <dd id="rdFp">—</dd>  <dd class="u">km</dd>
+        </div>
+      </dl>
+    </section>
+
+    <section class="panel__section">
+      <h2 class="panel__title">› next passes <span class="panel__title-sub" id="passInfo"></span></h2>
+      <div id="passes" class="passes">
+        <div class="passes__empty">selecciona un satélite y pulsa <em>predict</em></div>
+      </div>
+    </section>
+  </aside>
+</main>
+
+<footer class="footer">
+  <span>sgp4 + wasm · ningún backend · datos: <a href="https://celestrak.org/" target="_blank" rel="noopener">celestrak.org</a></span>
+  <span id="lastTleUpdate"></span>
+</footer>
+
+<script src="wasm_exec.js"></script>
+<script src="main.js"></script>
+</body>
+</html>
